@@ -24,21 +24,7 @@ static inline i32 fixed_mul(i32 a, i32 b)
 #define WAVETABLE_SIZE 256
 #define WAVETABLE_MASK (WAVETABLE_SIZE - 1)
 
-extern const i16 SINE_LUT[WAVETABLE_SIZE];
-
-static inline i32 fixed_sin(u32 phase)
-{
-    u32 index = phase >> 24;       // top 8 bits for indexing
-    u32 frac = phase & 0x00FFFFFF; // lower 24 bits for frac
-    // lerp time!
-    i16 p1 = SINE_LUT[index & WAVETABLE_MASK];
-    i16 p2 = SINE_LUT[(index + 1) & WAVETABLE_MASK]; // wrap around
-    i32 delta = (i32)p2 - (i32)p1;
-    i32 interpolated = p1 + (i32)(((i64)delta * frac) >> 24);
-    return interpolated << 1; // norm to Q16 (32767 -> 65534)
-}
-
-const i16 SINE_LUT[WAVETABLE_SIZE] = {
+static const i16 SINE_LUT[WAVETABLE_SIZE] = {
     0, 804, 1607, 2410, 3211, 4011, 4807, 5601,
     6392, 7179, 7961, 8739, 9511, 10278, 11039, 11792,
     12539, 13278, 14009, 14732, 15446, 16151, 16845, 17530,
@@ -71,6 +57,20 @@ const i16 SINE_LUT[WAVETABLE_SIZE] = {
     -18205, -17531, -16846, -16152, -15447, -14733, -14010, -13279,
     -12540, -11793, -11040, -10279, -9512, -8740, -7962, -7180,
     -6393, -5602, -4808, -4012, -3212, -2411, -1608, -805};
+
+static inline i32 fixed_sin(u32 phase)
+{
+    u32 index = phase >> 24;       // top 8 bits for indexing
+    u32 frac = phase & 0x00FFFFFF; // lower 24 bits for frac
+    // lerp time!
+    i16 p1 = SINE_LUT[index & WAVETABLE_MASK];
+    i16 p2 = SINE_LUT[(index + 1) & WAVETABLE_MASK]; // wrap around
+    i32 delta = (i32)p2 - (i32)p1;
+    i32 interpolated = p1 + (i32)(((i64)delta * frac) >> 24);
+    // Although 1 is 65536 in Q16, wavetable is i16, so max is 32767
+    // return as is (effectively 0.5 - 0.5 range)
+    return interpolated;
+}
 
 // Common end
 
@@ -108,6 +108,10 @@ void osc_build_wavetable(i16 *target_buf, const i32 *harmonics, const u32 *phase
         // add each harmonic
         for (int h = 0; h < count; h++)
         {
+            if (h >= 128)
+            {
+                break; // over Nyquist freq
+            }
             i32 amp = harmonics[h];
             if (amp == 0)
                 continue; // no amp
@@ -133,7 +137,10 @@ void osc_build_wavetable(i16 *target_buf, const i32 *harmonics, const u32 *phase
 
     scaler = ((i64)32760 << FIXED_SHIFT) / max_amp;
 
-    // for each slot in wavetable
+    // Second pass to apply norm
+    // Alternatively, one can cache previous calculation in a u32 array
+    // but recomputing is more memory efficient
+    // besides, this is only done once at init
     for (int i = 0; i < WAVETABLE_SIZE; i++)
     {
         i32 sample = 0;
@@ -207,6 +214,7 @@ typedef struct
 #define ENV_FIXED_SHIFT 24
 #define ENV_FIXED_ONE (1 << ENV_FIXED_SHIFT)
 
+// Remember to use env_sustain_to_hp in user code for sustain level conversion
 static inline void env_init(Env *env, i32 attack, i32 decay, i32 sustain_level, i32 release)
 {
     env->state = ENV_IDLE;
@@ -303,7 +311,7 @@ typedef struct
     i32 band;
 
     i32 cutoff;
-    i32 q;
+    i32 damping; // inverse proportional w/ q
 } Filter;
 
 static inline void filter_init(Filter *filter, int cutoff_freq, int sr)
@@ -312,12 +320,13 @@ static inline void filter_init(Filter *filter, int cutoff_freq, int sr)
     filter->band = 0;
 
     // calculate cutoff
-    // F = (2 * 3.14 * freq) / rate
-    u64 temp = (u64)cutoff_freq * 2 * PI;
-    filter->cutoff = (i32)(temp / sr);
-
-    // clamp to prevent explosion
-    if (filter->cutoff > 52429) // ~0.8 in Q16.16
+    // F = 2*sin(PI * freq / sr)
+    u32 phase = (u32)(((u64)cutoff_freq << 31) / sr); // phase = freq * 2^31 / sr
+    filter->cutoff = fixed_sin(phase) * 2;            // 2 * sin(PI * freq / sr), in Q16
+    // Clamping to ~0.8 in Q16.16 to avoid instability
+    // This means its max cutoff will be around 5.6k @ 44.1khz
+    // 2x sampling can double this limit but requires more CPU
+    if (filter->cutoff > 52429)
     {
         filter->cutoff = 52429;
     }
@@ -327,11 +336,11 @@ static inline void filter_init(Filter *filter, int cutoff_freq, int sr)
 static inline i32 filter_process(Filter *f, i32 input)
 {
 
-    f->low += fixed_mul(f->cutoff, f->band);
-
-    i32 high = input - f->low - fixed_mul(f->q, f->band);
+    i32 high = input - f->low - fixed_mul(f->damping, f->band);
 
     f->band += fixed_mul(f->cutoff, high);
+
+    f->low += fixed_mul(f->cutoff, f->band);
 
     return f->low;
 }
@@ -352,7 +361,7 @@ static inline void voice_init(Voice *v, const i16 *wavetable)
     v->filter.low = 0;
     v->filter.band = 0;
     v->filter.cutoff = FIXED_ONE; // Open
-    v->filter.q = 0;
+    v->filter.damping = 0.5;
     v->wavetable = wavetable;
 }
 

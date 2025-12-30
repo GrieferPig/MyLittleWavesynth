@@ -133,7 +133,7 @@ int main(int argc, char *argv[])
       env_init(&g_synth.voices[i].env, attack, decay, sustain, release);
 
       filter_init(&g_synth.voices[i].filter, 500, SAMPLE_RATE);
-      g_synth.voices[i].filter.q = FIXED_ONE;
+      g_synth.voices[i].filter.damping = FIXED_ONE;
    }
 
    g_synth.sample_counter = 0;
