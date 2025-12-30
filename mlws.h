@@ -360,8 +360,8 @@ static inline void voice_init(Voice *v, const i16 *wavetable)
     env_init(&v->env, 0, 0, FIXED_ONE, 0);
     v->filter.low = 0;
     v->filter.band = 0;
-    v->filter.cutoff = FIXED_ONE; // Open
-    v->filter.damping = 0.5;
+    v->filter.cutoff = 52429;  // ~0.8 in Q16.16, 5.6k @ 44.1kHz
+    v->filter.damping = 32768; // Q16.16 = 0.5
     v->wavetable = wavetable;
 }
 
