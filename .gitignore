@@ -1,0 +1,13 @@
+synth
+main
+output*
+
+build/
+
+*.elf
+*.rpx
+*.wuhb
+
+.vscode/
+
+example/posix/example
