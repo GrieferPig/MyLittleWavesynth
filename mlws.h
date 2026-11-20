@@ -10,15 +10,92 @@ typedef unsigned short u16;
 typedef signed char i8;
 typedef unsigned char u8;
 
-#define FIXED_SHIFT 16
-#define FIXED_ONE (1 << FIXED_SHIFT)
-#define PI 205888 // 3.14159 << FIXED_SHIFT
-#define TO_FIXED(a) ((a) << FIXED_SHIFT)
-#define TO_INT(a) ((a) >> FIXED_SHIFT)
+// -----------------------------------------------------------------
+// Public unit types for semantic representation
+
+typedef struct { u32 value; } mlws_hz_t;
+typedef struct { u32 value; } mlws_ms_t;
+typedef struct { u8 value; } mlws_percent_t;      // 0..100
+typedef struct { i8 value; } mlws_bipolar_t;      // -100..100
+typedef struct { i16 value; } mlws_cents_t;
+typedef struct { i8 value; } mlws_semitones_t;
+
+static inline mlws_hz_t Hz(u32 value)
+{
+    mlws_hz_t out = {value};
+    return out;
+}
+
+static inline mlws_ms_t Ms(u32 value)
+{
+    mlws_ms_t out = {value};
+    return out;
+}
+
+static inline mlws_percent_t Percent(u32 value)
+{
+    if (value > 100)
+        value = 100;
+
+    mlws_percent_t out = {(u8)value};
+    return out;
+}
+
+static inline mlws_bipolar_t Bipolar(i32 value)
+{
+    if (value < -100)
+        value = -100;
+    else if (value > 100)
+        value = 100;
+
+    mlws_bipolar_t out = {(i8)value};
+    return out;
+}
+
+static inline mlws_cents_t Cents(i32 value)
+{
+    if (value < -32768)
+        value = -32768;
+    else if (value > 32767)
+        value = 32767;
+
+    mlws_cents_t out = {(i16)value};
+    return out;
+}
+
+static inline mlws_semitones_t Semitones(i32 value)
+{
+    if (value < -128)
+        value = -128;
+    else if (value > 127)
+        value = 127;
+
+    mlws_semitones_t out = {(i8)value};
+    return out;
+}
+
+#define FIXED_SHIFT_Q16 16
+#define FIXED_SHIFT_Q8 8
+#define FIXED_ONE_Q16 (1 << FIXED_SHIFT_Q16)
+#define FIXED_ONE_Q8 (1 << FIXED_SHIFT_Q8)
+#define PI 205888 // 3.14159 << FIXED_SHIFT_Q16
+#define TO_FIXED(a) ((a) << FIXED_SHIFT_Q16)
+#define TO_INT(a) ((a) >> FIXED_SHIFT_Q16)
 
 static inline i32 fixed_mul(i32 a, i32 b)
 {
-    return (i32)((long long)a * b >> FIXED_SHIFT);
+    return (i32)((long long)a * b >> FIXED_SHIFT_Q16);
+}
+
+// Translate public unit values to common internal fixed-point values.
+static inline i32 mlws_percent_to_q16(mlws_percent_t percent)
+{
+    return ((i32)percent.value * FIXED_ONE_Q16) / 100;
+}
+
+static inline i32 mlws_bipolar_to_q16(mlws_bipolar_t amount)
+{
+    return ((i32)amount.value * FIXED_ONE_Q16) / 100;
 }
 
 #define WAVETABLE_SIZE 256
@@ -90,15 +167,36 @@ static inline void osc_init(Osc *osc)
 }
 
 // Use i32 overflow to wrap phase
-static inline void osc_set_frequency(Osc *osc, u32 frequency, u32 sample_rate)
+static inline void osc_set_frequency(Osc *osc, mlws_hz_t frequency, mlws_hz_t sample_rate)
 {
-    osc->increment = ((u64)frequency << 32) / sample_rate;
+    if (sample_rate.value == 0)
+    {
+        osc->increment = 0;
+        return;
+    }
+
+    osc->increment = ((u64)frequency.value << 32) / sample_rate.value;
 }
 
-void osc_build_wavetable(i16 *target_buf, const i32 *harmonics, const u32 *phases, int count)
+static inline void osc_build_wavetable(i16 *target_buf, const i32 *harmonics, const u32 *phases, int count)
 {
+    if (!target_buf)
+        return;
+
+    if (!harmonics || count <= 0)
+    {
+        for (int i = 0; i < WAVETABLE_SIZE; i++)
+            target_buf[i] = 0;
+        return;
+    }
     // Measure max amplitude for normalization
     i32 max_amp = 1;
+
+    int harmonic_count = count;
+
+    // Limit harmonic count to half of wavetable size to avoid aliasing
+    if (harmonic_count > WAVETABLE_SIZE / 2)
+        harmonic_count = WAVETABLE_SIZE / 2;
 
     for (int i = 0; i < WAVETABLE_SIZE; i++)
     {
@@ -106,12 +204,8 @@ void osc_build_wavetable(i16 *target_buf, const i32 *harmonics, const u32 *phase
         u32 base_phase = ((u32)i) << 24; // top 8 bits for sin
 
         // add each harmonic
-        for (int h = 0; h < count; h++)
+        for (int h = 0; h < harmonic_count; h++)
         {
-            if (h >= 128)
-            {
-                break; // over Nyquist freq
-            }
             i32 amp = harmonics[h];
             if (amp == 0)
                 continue; // no amp
@@ -135,7 +229,7 @@ void osc_build_wavetable(i16 *target_buf, const i32 *harmonics, const u32 *phase
 
     i32 scaler;
 
-    scaler = ((i64)32760 << FIXED_SHIFT) / max_amp;
+    scaler = ((i64)32760 << FIXED_SHIFT_Q16) / max_amp;
 
     // Second pass to apply norm
     // Alternatively, one can cache previous calculation in a u32 array
@@ -147,7 +241,7 @@ void osc_build_wavetable(i16 *target_buf, const i32 *harmonics, const u32 *phase
         u32 base_phase = ((u32)i) << 24; // top 8 bits for sin
 
         // add each harmonic
-        for (int h = 0; h < count; h++)
+        for (int h = 0; h < harmonic_count; h++)
         {
             i32 amp = harmonics[h];
             if (amp == 0)
@@ -201,107 +295,205 @@ typedef enum
 typedef struct
 {
     EnvState state;
-    i32 curr_level; // Q8.24
+    i32 curr_level; // Q8.24 amplitude, 0..1
 
-    i32 attack;
-    i32 decay;
+    // Stage times are stored as sample counts so decay/release duration does
+    // not accidentally depend on sustain/current level.
+    u32 attack;
+    u32 decay;
     i32 sustain_level;
-    i32 release;
+    u32 release;
+
+    // Interpolation state for the currently running stage.
+    i32 stage_start;
+    i32 stage_target;
+    u32 stage_pos;
+    u32 stage_samples;
 } Env;
 
 // Env need higher decimal precision for smoothness
 // Use Q8.24 format
-#define ENV_FIXED_SHIFT 24
-#define ENV_FIXED_ONE (1 << ENV_FIXED_SHIFT)
+#define ENV_FIXED_SHIFT_Q16 24
+#define ENV_FIXED_ONE_Q16 (1 << ENV_FIXED_SHIFT_Q16)
 
-// Remember to use env_sustain_to_hp in user code for sustain level conversion
-static inline void env_init(Env *env, i32 attack, i32 decay, i32 sustain_level, i32 release)
+static inline u32 env_ms_to_samples(mlws_ms_t time, mlws_hz_t sample_rate)
+{
+    if (time.value == 0 || sample_rate.value == 0)
+        return 0;
+
+    u64 total_samples = ((u64)time.value * sample_rate.value + 999) / 1000;
+    if (total_samples == 0)
+        total_samples = 1;
+    if (total_samples > 0xFFFFFFFFULL)
+        total_samples = 0xFFFFFFFFULL;
+
+    return (u32)total_samples;
+}
+
+static inline i32 env_percent_to_level(mlws_percent_t percent)
+{
+    return ((i32)percent.value * ENV_FIXED_ONE_Q16) / 100;
+}
+
+// Decay/release use an RC-like ease-out curve
+static inline i32 env_rc_curve_q16(i32 t)
+{
+    if (t <= 0)
+        return 0;
+    if (t >= FIXED_ONE_Q16)
+        return FIXED_ONE_Q16;
+
+    i32 remaining = FIXED_ONE_Q16 - t;
+    return FIXED_ONE_Q16 - fixed_mul(remaining, remaining);
+}
+
+static inline void env_begin_stage(Env *env, EnvState state, i32 target, u32 samples)
+{
+    env->state = state;
+    env->stage_start = env->curr_level;
+    env->stage_target = target;
+    env->stage_pos = 0;
+    env->stage_samples = samples;
+}
+
+static inline u32 env_attack_samples_from_level(const Env *env)
+{
+    if (env->attack == 0 || env->curr_level >= ENV_FIXED_ONE_Q16)
+        return 0;
+    if (env->curr_level <= 0)
+        return env->attack;
+
+    u32 remaining = (u32)(ENV_FIXED_ONE_Q16 - env->curr_level);
+    u64 scaled = (u64)env->attack * remaining;
+    scaled = (scaled + (u32)ENV_FIXED_ONE_Q16 - 1) / (u32)ENV_FIXED_ONE_Q16;
+    if (scaled == 0)
+        scaled = 1;
+    if (scaled > 0xFFFFFFFFULL)
+        scaled = 0xFFFFFFFFULL;
+    return (u32)scaled;
+}
+
+static inline void env_set_attack(Env *env, mlws_ms_t attack, mlws_hz_t sample_rate)
+{
+    env->attack = env_ms_to_samples(attack, sample_rate);
+}
+
+static inline void env_set_decay(Env *env, mlws_ms_t decay, mlws_hz_t sample_rate)
+{
+    env->decay = env_ms_to_samples(decay, sample_rate);
+}
+
+static inline void env_set_sustain(Env *env, mlws_percent_t sustain)
+{
+    env->sustain_level = env_percent_to_level(sustain);
+
+    if (env->state == ENV_SUSTAIN)
+        env->curr_level = env->sustain_level;
+    else if (env->state == ENV_DECAY)
+        env_begin_stage(env, ENV_DECAY, env->sustain_level, env->decay);
+}
+
+static inline void env_set_release(Env *env, mlws_ms_t release, mlws_hz_t sample_rate)
+{
+    env->release = env_ms_to_samples(release, sample_rate);
+}
+
+static inline void env_init(
+    Env *env,
+    mlws_ms_t attack,
+    mlws_ms_t decay,
+    mlws_percent_t sustain,
+    mlws_ms_t release,
+    mlws_hz_t sample_rate)
 {
     env->state = ENV_IDLE;
     env->curr_level = 0;
-    env->attack = attack;
-    env->decay = decay;
-    env->sustain_level = sustain_level;
-    env->release = release;
+    env->stage_start = 0;
+    env->stage_target = 0;
+    env->stage_pos = 0;
+    env->stage_samples = 0;
+
+    env_set_attack(env, attack, sample_rate);
+    env_set_decay(env, decay, sample_rate);
+    env_set_sustain(env, sustain);
+    env_set_release(env, release, sample_rate);
 }
 
 static inline void env_note_on(Env *env)
 {
-    env->state = ENV_ATTACK;
+    env_begin_stage(
+        env,
+        ENV_ATTACK,
+        ENV_FIXED_ONE_Q16,
+        env_attack_samples_from_level(env));
 }
 
 static inline void env_note_off(Env *env)
 {
-    env->state = ENV_RELEASE;
+    env_begin_stage(env, ENV_RELEASE, 0, env->release);
 }
 
-static inline i32 env_ms_to_increment(u32 ms, u32 sr)
+static inline void env_advance_stage(Env *env)
 {
-    if (ms == 0)
+    if (env->state == ENV_ATTACK)
+        env_begin_stage(env, ENV_DECAY, env->sustain_level, env->decay);
+    else if (env->state == ENV_DECAY)
     {
-        return ENV_FIXED_ONE; // instant
+        env->state = ENV_SUSTAIN;
+        env->curr_level = env->sustain_level;
     }
-    u64 target = (u64)ENV_FIXED_ONE;
-    u64 total_samples = ((u64)ms * sr) / 1000;
-    if (total_samples == 0)
+    else if (env->state == ENV_RELEASE)
     {
-        total_samples = 1;
+        env->state = ENV_IDLE;
+        env->curr_level = 0;
     }
-    // return increment rate until 1.0 in high precision
-    return (i32)(target / total_samples);
 }
 
-// sustain level is in Q16.16 -> Q8.24
-static inline i32 env_sustain_to_hp(i32 sustain)
-{
-    return ((i32)sustain) << (ENV_FIXED_SHIFT - FIXED_SHIFT);
-}
-
-// env state machine impl
+// Envelope state machine. Output is Q16.16 linear amplitude.
 static inline i32 env_process(Env *env)
 {
-    switch (env->state)
+    for (int transitions = 0; transitions < 3; transitions++)
     {
-    case ENV_IDLE:
-        // reset level
-        env->curr_level = 0;
-        break;
-    case ENV_ATTACK:
-        env->curr_level += env->attack;
-        if (env->curr_level >= ENV_FIXED_ONE)
+        if (env->state == ENV_IDLE)
         {
-            // reach max
-            env->curr_level = ENV_FIXED_ONE;
-            env->state = ENV_DECAY;
-        }
-        break;
-    case ENV_DECAY:
-        env->curr_level -= env->decay;
-        if (env->curr_level <= env->sustain_level)
-        {
-            // reach sustain
-            env->curr_level = env->sustain_level;
-            env->state = ENV_SUSTAIN;
-        }
-        break;
-    case ENV_SUSTAIN:
-        // hold level
-        env->curr_level = env->sustain_level;
-        break;
-    case ENV_RELEASE:
-        env->curr_level -= env->release;
-        if (env->curr_level <= 0)
-        {
-            // reach zero
             env->curr_level = 0;
-            env->state = ENV_IDLE;
+            return 0;
+        }
+
+        if (env->state == ENV_SUSTAIN)
+        {
+            env->curr_level = env->sustain_level;
+            break;
+        }
+
+        if (env->stage_samples == 0)
+        {
+            env->curr_level = env->stage_target;
+            env_advance_stage(env);
+            continue;
+        }
+
+        if (env->stage_pos < env->stage_samples)
+            env->stage_pos++;
+
+        i32 t = (i32)(((u64)env->stage_pos << FIXED_SHIFT_Q16) / env->stage_samples);
+        if (t > FIXED_ONE_Q16)
+            t = FIXED_ONE_Q16;
+
+        // Linear attack; RC-like decay/release.
+        i32 curve = (env->state == ENV_ATTACK) ? t : env_rc_curve_q16(t);
+        i64 delta = (i64)env->stage_target - env->stage_start;
+        env->curr_level = env->stage_start + (i32)((delta * curve) >> FIXED_SHIFT_Q16);
+
+        if (env->stage_pos >= env->stage_samples)
+        {
+            env->curr_level = env->stage_target;
+            env_advance_stage(env);
         }
         break;
     }
 
-    // Convert to Q16.16 and apply logarithmic curve (x^2) for perceived loudness
-    i32 linear = (i32)(env->curr_level >> (ENV_FIXED_SHIFT - FIXED_SHIFT));
-    return fixed_mul(linear, linear);
+    return (i32)(env->curr_level >> (ENV_FIXED_SHIFT_Q16 - FIXED_SHIFT_Q16));
 }
 
 // SVF filter impl
@@ -314,22 +506,50 @@ typedef struct
     i32 damping; // inverse proportional w/ q
 } Filter;
 
-static inline void filter_init(Filter *filter, int cutoff_freq, int sr)
+static inline void filter_set_cutoff(Filter *filter, mlws_hz_t cutoff, mlws_hz_t sample_rate)
+{
+    if (sample_rate.value == 0)
+{
+        filter->cutoff = 0;
+        return;
+    }
+
+    // Frequencies above Nyquist are not representable. Without this clamp,
+    // values near/above sample_rate wrap the sine phase and can make the
+    // cutoff fall back toward zero.
+    u32 nyquist = sample_rate.value / 2;
+    u32 cutoff_hz = cutoff.value;
+    if (cutoff_hz > nyquist)
+        cutoff_hz = nyquist;
+
+    // F = 2*sin(PI * freq / sr)
+    u32 phase = (u32)(((u64)cutoff_hz << 31) / sample_rate.value);
+    filter->cutoff = fixed_sin(phase) * 2;
+
+    // Clamp to ~0.8 in Q16.16 to keep this Chamberlin SVF stable.
+    if (filter->cutoff > 52429)
+        filter->cutoff = 52429;
+    }
+
+static inline void filter_set_resonance(Filter *filter, mlws_percent_t resonance)
+{
+    // 0% = no resonance,
+    // 100% = maximum resonance.
+    mlws_percent_t damping_percent = Percent(100 - resonance.value);
+    filter->damping = mlws_percent_to_q16(damping_percent);
+}
+
+static inline void filter_init(
+    Filter *filter,
+    mlws_hz_t cutoff,
+    mlws_percent_t resonance,
+    mlws_hz_t sample_rate)
 {
     filter->low = 0;
     filter->band = 0;
 
-    // calculate cutoff
-    // F = 2*sin(PI * freq / sr)
-    u32 phase = (u32)(((u64)cutoff_freq << 31) / sr); // phase = freq * 2^31 / sr
-    filter->cutoff = fixed_sin(phase) * 2;            // 2 * sin(PI * freq / sr), in Q16
-    // Clamping to ~0.8 in Q16.16 to avoid instability
-    // This means its max cutoff will be around 5.6k @ 44.1khz
-    // 2x sampling can double this limit but requires more CPU
-    if (filter->cutoff > 52429)
-    {
-        filter->cutoff = 52429;
-    }
+    filter_set_cutoff(filter, cutoff, sample_rate);
+    filter_set_resonance(filter, resonance);
 }
 
 // Chamberlin SVF impl
@@ -348,32 +568,95 @@ static inline i32 filter_process(Filter *f, i32 input)
 // Voice = single note with osc, env, filter
 typedef struct
 {
+    u32 sample_rate;
+
     Osc osc;
     Env env;
     Filter filter;
     const i16 *wavetable;
 } Voice;
 
-static inline void voice_init(Voice *v, const i16 *wavetable)
+static inline void voice_init(Voice *v, const i16 *wavetable, mlws_hz_t sample_rate)
 {
+    v->sample_rate = sample_rate.value;
     osc_init(&v->osc);
-    env_init(&v->env, 0, 0, FIXED_ONE, 0);
-    v->filter.low = 0;
-    v->filter.band = 0;
-    v->filter.cutoff = 52429;  // ~0.8 in Q16.16, 5.6k @ 44.1kHz
-    v->filter.damping = 32768; // Q16.16 = 0.5
+
+    env_init(
+        &v->env,
+        Ms(0),
+        Ms(0),
+        Percent(100),
+        Ms(0),
+        sample_rate);
+
+    filter_init(
+        &v->filter,
+        Hz(5600),
+        Percent(50),
+        sample_rate);
+
     v->wavetable = wavetable;
 }
 
-static inline void voice_note_on(Voice *v, u32 freq, u32 sample_rate)
+static inline void voice_note_on(Voice *v, mlws_hz_t frequency)
 {
-    osc_set_frequency(&v->osc, freq, sample_rate);
+    osc_set_frequency(&v->osc, frequency, Hz(v->sample_rate));
     env_note_on(&v->env);
 }
 
 static inline void voice_note_off(Voice *v)
 {
     env_note_off(&v->env);
+}
+
+// Voice-level setters reuse the sample rate stored at initialization.
+static inline void voice_set_attack(Voice *v, mlws_ms_t attack)
+{
+    env_set_attack(&v->env, attack, Hz(v->sample_rate));
+}
+
+static inline void voice_set_decay(Voice *v, mlws_ms_t decay)
+{
+    env_set_decay(&v->env, decay, Hz(v->sample_rate));
+}
+
+static inline void voice_set_sustain(Voice *v, mlws_percent_t sustain)
+{
+    env_set_sustain(&v->env, sustain);
+}
+
+static inline void voice_set_release(Voice *v, mlws_ms_t release)
+{
+    env_set_release(&v->env, release, Hz(v->sample_rate));
+}
+
+static inline void voice_set_envelope(
+    Voice *v,
+    mlws_ms_t attack,
+    mlws_ms_t decay,
+    mlws_percent_t sustain,
+    mlws_ms_t release)
+{
+    env_set_attack(&v->env, attack, Hz(v->sample_rate));
+    env_set_decay(&v->env, decay, Hz(v->sample_rate));
+    env_set_sustain(&v->env, sustain);
+    env_set_release(&v->env, release, Hz(v->sample_rate));
+}
+
+static inline void voice_set_cutoff(Voice *v, mlws_hz_t cutoff)
+{
+    filter_set_cutoff(&v->filter, cutoff, Hz(v->sample_rate));
+}
+
+static inline void voice_set_resonance(Voice *v, mlws_percent_t resonance)
+{
+    filter_set_resonance(&v->filter, resonance);
+}
+
+static inline void voice_set_filter(Voice *v, mlws_hz_t cutoff, mlws_percent_t resonance)
+{
+    filter_set_cutoff(&v->filter, cutoff, Hz(v->sample_rate));
+    filter_set_resonance(&v->filter, resonance);
 }
 
 static inline i32 voice_process(Voice *v)
@@ -390,8 +673,123 @@ static inline void voice_process_block(Voice *v, i32 *out, int num_samples, int 
     {
         i32 sample = voice_process(v);
         if (accumulate)
-            out[i] += sample;
+        {
+            i64 mixed = (i64)out[i] + sample;
+            if (mixed > 2147483647LL)
+                mixed = 2147483647LL;
+            else if (mixed < (-2147483647LL - 1LL))
+                mixed = (-2147483647LL - 1LL);
+            out[i] = (i32)mixed;
+        }
         else
             out[i] = sample;
     }
+}
+
+// -----------------------------------------------------------------
+// Polyphonic mixing helpers
+
+#ifndef MLWS_MASTER_GAIN_Q16
+#define MLWS_MASTER_GAIN_Q16 16384
+#endif
+
+static inline i16 mlws_mix_to_i16_i64(i64 sample)
+{
+    if (sample > 32767)
+        return 32767;
+    if (sample < -32768)
+        return -32768;
+        return (i16)sample;
+}
+
+
+static inline i16 mlws_soft_clip_i16(i32 sample)
+{
+    return mlws_mix_to_i16_i64(sample);
+}
+
+// Sum voices without reducing to i32 first. This wide bus is the fixed-point
+// equivalent of the floating-point summing bus used by conventional synths.
+static inline i64 voice_mix_sum_i64(Voice *voices, int voice_count)
+{
+    if (!voices || voice_count <= 0)
+        return 0;
+
+    i64 sum = 0;
+    for (int i = 0; i < voice_count; i++)
+        sum += (i64)voice_process(&voices[i]);
+
+    return sum;
+}
+
+// Optional mixer object for callers that want a runtime-adjustable but still
+// CONSTANT master gain. It never tracks active_voice_count.
+typedef struct
+{
+    i32 gain_q16;
+} VoiceMixer;
+
+static inline void voice_mixer_init_gain(VoiceMixer *mixer, i32 gain_q16)
+{
+    if (!mixer)
+        return;
+
+    if (gain_q16 < 0)
+        gain_q16 = 0;
+
+    mixer->gain_q16 = gain_q16;
+}
+
+static inline void voice_mixer_init(VoiceMixer *mixer, int voice_capacity)
+{
+    (void)voice_capacity;
+    voice_mixer_init_gain(mixer, MLWS_MASTER_GAIN_Q16);
+}
+
+static inline void voice_mixer_set_gain(VoiceMixer *mixer, i32 gain_q16)
+{
+    voice_mixer_init_gain(mixer, gain_q16);
+}
+
+static inline i16 voice_mixer_process(VoiceMixer *mixer, Voice *voices, int active_voice_count)
+{
+    if (!mixer || !voices || active_voice_count <= 0)
+        return 0;
+
+    i64 sum = voice_mix_sum_i64(voices, active_voice_count);
+    i64 scaled = (sum * (i64)mixer->gain_q16) >> FIXED_SHIFT_Q16;
+    return mlws_mix_to_i16_i64(scaled);
+}
+
+static inline void voice_mixer_process_block(
+    VoiceMixer *mixer,
+    Voice *voices,
+    int active_voice_count,
+    i16 *out,
+    int num_samples)
+{
+    if (!out || num_samples <= 0)
+        return;
+
+    for (int i = 0; i < num_samples; i++)
+        out[i] = voice_mixer_process(mixer, voices, active_voice_count);
+}
+
+static inline i16 voice_mix_process(Voice *voices, int voice_count)
+{
+    if (!voices || voice_count <= 0)
+        return 0;
+
+    i64 sum = voice_mix_sum_i64(voices, voice_count);
+    i64 scaled = (sum * (i64)MLWS_MASTER_GAIN_Q16) >> FIXED_SHIFT_Q16;
+    return mlws_mix_to_i16_i64(scaled);
+}
+
+static inline void voice_mix_process_block(Voice *voices, int voice_count, i16 *out, int num_samples)
+{
+    if (!out || num_samples <= 0)
+        return;
+
+    for (int i = 0; i < num_samples; i++)
+        out[i] = voice_mix_process(voices, voice_count);
 }
